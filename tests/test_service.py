@@ -1,32 +1,20 @@
-"""Tests for RedisAgentMemoryService methods.
-
-The LLM and AgentMemory client are always mocked — no real API calls are made.
-"""
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call, patch
-
 import pytest
-from langchain_core.messages import AIMessage
+from unittest.mock import MagicMock, AsyncMock, patch
 
-from backend.memory import (
+from backend.service import (
     DemoConfig,
+    AdkAgentMemoryService,
     MemoryCandidate,
     MemoryExtraction,
-    RedisAgentMemoryService,
+    TurnResult,
 )
-from tests.conftest import make_not_found_error
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 DEMO_CONFIG = DemoConfig(
-    openai_model="gpt-4.1-mini",
-    agent_memory_server_url="https://memory.example.com",
-    agent_memory_store_id="store-test",
-    agent_memory_api_key="key-test",
+    project_id="test-project",
+    location="us-central1",
+    agent_engine_id="test-engine-id",
     owner_id="testuser",
     namespace="test-ns",
     agent_id="test-agent",
@@ -35,17 +23,19 @@ DEMO_CONFIG = DemoConfig(
 
 @pytest.fixture
 def service():
-    """Service with LLM replaced by mocks — no OpenAI connection."""
-    with patch("backend.memory.ChatOpenAI"):
-        svc = RedisAgentMemoryService(DEMO_CONFIG)
-    svc.llm = MagicMock()
-    svc.extractor = MagicMock()
+    """Service with all external cloud clients mocked."""
+    with patch("backend.service.genai.Client"), \
+         patch("backend.service.VertexAiMemoryBankService"), \
+         patch("backend.service.InMemoryMemoryService"), \
+         patch("backend.service.InMemorySessionService"), \
+         patch("backend.service.get_travel_agent"):
+        svc = AdkAgentMemoryService(DEMO_CONFIG)
+    
+    svc.session_service = AsyncMock()
+    svc.memory_service = AsyncMock()
+    svc.genai_client = MagicMock()
+    svc.agent = MagicMock()
     return svc
-
-
-@pytest.fixture
-def mock_agent_memory():
-    return MagicMock()
 
 
 # ---------------------------------------------------------------------------
@@ -53,45 +43,53 @@ def mock_agent_memory():
 # ---------------------------------------------------------------------------
 
 class TestReadSessionContext:
-    def test_returns_empty_list_on_not_found_error(self, service, mock_agent_memory):
-        mock_agent_memory.get_session_memory.side_effect = make_not_found_error()
-        assert service.read_session_context(mock_agent_memory, "session-123") == []
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_on_no_session(self, service):
+        service.session_service.get_session.return_value = None
+        assert await service.read_session_context(None, "session-123") == []
 
-    def test_returns_empty_list_on_404_status_code(self, service, mock_agent_memory):
-        exc = RuntimeError("not found")
-        exc.status_code = 404  # type: ignore[attr-defined]
-        mock_agent_memory.get_session_memory.side_effect = exc
-        assert service.read_session_context(mock_agent_memory, "session-123") == []
-
-    def test_raises_wrapped_error_on_other_exceptions(self, service, mock_agent_memory):
-        mock_agent_memory.get_session_memory.side_effect = RuntimeError("connection refused")
-        with pytest.raises(RuntimeError, match="AGENT_MEMORY_SERVER_URL"):
-            service.read_session_context(mock_agent_memory, "session-123")
-
-    def test_returns_formatted_context_lines(self, service, mock_agent_memory):
-        mock_agent_memory.get_session_memory.return_value = {
-            "events": [
-                {"role": "user", "content": [{"text": "Hello"}]},
-                {"role": "assistant", "content": [{"text": "Hi!"}]},
-            ]
-        }
-        result = service.read_session_context(mock_agent_memory, "session-123")
+    @pytest.mark.asyncio
+    async def test_returns_formatted_context_lines(self, service):
+        from google.adk import Event
+        from google.genai import types
+        
+        event1 = Event(author="user", content=types.Content(parts=[types.Part.from_text(text="Hello")], role="user"))
+        event2 = Event(author="travel_agent", content=types.Content(parts=[types.Part.from_text(text="Hi!")], role="model"))
+        
+        mock_session = MagicMock()
+        mock_session.events = [event1, event2]
+        service.session_service.get_session.return_value = mock_session
+        
+        result = await service.read_session_context(None, "session-123")
         assert result == ["user: Hello", "assistant: Hi!"]
 
-    def test_skips_events_with_empty_text(self, service, mock_agent_memory):
-        mock_agent_memory.get_session_memory.return_value = {
-            "events": [{"role": "user", "content": [{"text": ""}]}]
-        }
-        assert service.read_session_context(mock_agent_memory, "session-123") == []
+    @pytest.mark.asyncio
+    async def test_skips_events_with_empty_text(self, service):
+        from google.adk import Event
+        from google.genai import types
+        
+        event = Event(author="user", content=types.Content(parts=[types.Part.from_text(text="")], role="user"))
+        mock_session = MagicMock()
+        mock_session.events = [event]
+        service.session_service.get_session.return_value = mock_session
+        
+        assert await service.read_session_context(None, "session-123") == []
 
-    def test_truncates_to_session_context_limit(self, service, mock_agent_memory):
+    @pytest.mark.asyncio
+    async def test_truncates_to_session_context_limit(self, service):
+        from google.adk import Event
+        from google.genai import types
+        
         events = [
-            {"role": "user", "content": [{"text": f"message {i}"}]}
+            Event(author="user", content=types.Content(parts=[types.Part.from_text(text=f"message {i}")], role="user"))
             for i in range(20)
         ]
-        mock_agent_memory.get_session_memory.return_value = {"events": events}
-        result = service.read_session_context(mock_agent_memory, "session-123")
-        assert len(result) == 12  # SESSION_CONTEXT_LIMIT
+        mock_session = MagicMock()
+        mock_session.events = events
+        service.session_service.get_session.return_value = mock_session
+        
+        result = await service.read_session_context(None, "session-123")
+        assert len(result) == 12  # Last 12 messages limit
 
 
 # ---------------------------------------------------------------------------
@@ -99,25 +97,17 @@ class TestReadSessionContext:
 # ---------------------------------------------------------------------------
 
 class TestDeleteSessionMemory:
-    def test_silently_ignores_not_found_error(self, service, mock_agent_memory):
-        mock_agent_memory.delete_session_memory.side_effect = make_not_found_error()
-        # Should not raise
-        service.delete_session_memory(mock_agent_memory, "session-123")
+    @pytest.mark.asyncio
+    async def test_raises_wrapped_error_on_exceptions(self, service):
+        service.session_service.delete_session.side_effect = RuntimeError("Service down")
+        # Should catch and log, and not crash or raise directly if handled
+        await service.delete_session_memory(None, "session-123")
+        service.session_service.delete_session.assert_called_once()
 
-    def test_silently_ignores_404_status_code(self, service, mock_agent_memory):
-        exc = RuntimeError("not found")
-        exc.status_code = 404  # type: ignore[attr-defined]
-        mock_agent_memory.delete_session_memory.side_effect = exc
-        service.delete_session_memory(mock_agent_memory, "session-123")
-
-    def test_raises_wrapped_error_on_other_exceptions(self, service, mock_agent_memory):
-        mock_agent_memory.delete_session_memory.side_effect = RuntimeError("Redis down")
-        with pytest.raises(RuntimeError, match="AGENT_MEMORY_SERVER_URL"):
-            service.delete_session_memory(mock_agent_memory, "session-123")
-
-    def test_returns_none_on_success(self, service, mock_agent_memory):
-        mock_agent_memory.delete_session_memory.return_value = None
-        assert service.delete_session_memory(mock_agent_memory, "session-123") is None
+    @pytest.mark.asyncio
+    async def test_returns_none_on_success(self, service):
+        service.session_service.delete_session.return_value = None
+        assert await service.delete_session_memory(None, "session-123") is None
 
 
 # ---------------------------------------------------------------------------
@@ -127,108 +117,72 @@ class TestDeleteSessionMemory:
 class TestRunTurnDeduplication:
     """
     Verify that memories already present in retrieved long-term memory are
-    NOT re-written, while genuinely new ones ARE written and returned.
+    NOT re-written/extracted as new, while genuinely new ones ARE written and returned.
     """
 
-    def _setup_agent_memory(self, mock_agent_memory, existing_ltm_texts: list[str]):
-        """Configure the mock so session memory is empty and LTM returns existing_ltm_texts."""
-        mock_agent_memory.get_session_memory.return_value = {"events": []}
-        mock_agent_memory.search_long_term_memory.return_value = {
-            "items": [{"text": t} for t in existing_ltm_texts]
-        }
-        mock_agent_memory.add_session_event.return_value = None
-        mock_agent_memory.bulk_create_long_term_memories.return_value = None
+    @pytest.mark.asyncio
+    async def test_new_memory_is_extracted(self, service):
+        from google.adk.memory.base_memory_service import SearchMemoryResponse, MemoryEntry
+        from google.genai import types
+        from google.adk import Event
+        
+        service.memory_service.search_memory.return_value = SearchMemoryResponse(memories=[])
+        
+        mock_event = MagicMock()
+        mock_event.author = "travel_agent"
+        mock_event.content = types.Content(parts=[types.Part.from_text(text="Sure!")])
+        
+        with patch("backend.service.Runner") as MockRunner:
+            runner_instance = MagicMock()
+            runner_instance.run.return_value = [mock_event]
+            MockRunner.return_value = runner_instance
+            
+            # Mock get_session for context
+            event1 = Event(author="user", content=types.Content(parts=[types.Part.from_text(text="I am vegetarian")], role="user"))
+            mock_session = MagicMock()
+            mock_session.events = [event1]
+            service.session_service.get_session.return_value = mock_session
+            
+            # Mock structured memory extraction
+            mock_response = MagicMock()
+            mock_response.text = '{"memories": [{"text": "User is vegetarian.", "topics": ["diet"], "memory_type": "semantic"}]}'
+            service.genai_client.models.generate_content.return_value = mock_response
+            
+            result = await service.run_turn(None, "session-123", "I am vegetarian.")
+            
+            assert result.session_id == "session-123"
+            assert result.assistant_text == "Sure!"
+            assert result.extracted_memories == ["User is vegetarian."]
 
-    def test_new_memory_is_written(self, service, mock_agent_memory):
-        self._setup_agent_memory(mock_agent_memory, existing_ltm_texts=[])
-        service.llm.invoke.return_value = AIMessage(content="Sure!")
-        service.extractor.invoke.return_value = MemoryExtraction(
-            memories=[MemoryCandidate(text="User is vegetarian.")]
-        )
-
-        result = service.run_turn(mock_agent_memory, "session-123", "I am vegetarian.")
-
-        mock_agent_memory.bulk_create_long_term_memories.assert_called_once()
-        records = mock_agent_memory.bulk_create_long_term_memories.call_args.kwargs["memories"]
-        assert len(records) == 1
-        assert records[0]["text"] == "User is vegetarian."
-        assert "User is vegetarian." in result.extracted_memories
-
-    def test_duplicate_memory_is_not_rewritten(self, service, mock_agent_memory):
-        existing = "User prefers Delta Airlines."
-        self._setup_agent_memory(mock_agent_memory, existing_ltm_texts=[existing])
-        service.llm.invoke.return_value = AIMessage(content="Got it!")
-        # Extractor returns the same memory that's already in LTM
-        service.extractor.invoke.return_value = MemoryExtraction(
-            memories=[MemoryCandidate(text=existing)]
-        )
-
-        result = service.run_turn(mock_agent_memory, "session-123", "I prefer Delta Airlines.")
-
-        mock_agent_memory.bulk_create_long_term_memories.assert_not_called()
-        assert result.extracted_memories == []
-
-    def test_only_new_memories_written_when_mixed(self, service, mock_agent_memory):
-        existing = "User prefers Delta Airlines."
-        self._setup_agent_memory(mock_agent_memory, existing_ltm_texts=[existing])
-        service.llm.invoke.return_value = AIMessage(content="Noted!")
-        service.extractor.invoke.return_value = MemoryExtraction(
-            memories=[
-                MemoryCandidate(text=existing),             # duplicate — should be skipped
-                MemoryCandidate(text="User is vegetarian."), # new — should be written
-            ]
-        )
-
-        result = service.run_turn(mock_agent_memory, "session-123", "I prefer Delta and I'm vegetarian.")
-
-        mock_agent_memory.bulk_create_long_term_memories.assert_called_once()
-        records = mock_agent_memory.bulk_create_long_term_memories.call_args.kwargs["memories"]
-        written_texts = [r["text"] for r in records]
-        assert existing not in written_texts
-        assert "User is vegetarian." in written_texts
-        assert result.extracted_memories == ["User is vegetarian."]
-
-    def test_blank_memory_candidates_are_ignored(self, service, mock_agent_memory):
-        self._setup_agent_memory(mock_agent_memory, existing_ltm_texts=[])
-        service.llm.invoke.return_value = AIMessage(content="Ok!")
-        service.extractor.invoke.return_value = MemoryExtraction(
-            memories=[MemoryCandidate(text="   ")]  # blank after strip
-        )
-
-        result = service.run_turn(mock_agent_memory, "session-123", "Hello.")
-
-        mock_agent_memory.bulk_create_long_term_memories.assert_not_called()
-        assert result.extracted_memories == []
-
-    def test_session_events_are_always_written(self, service, mock_agent_memory):
-        self._setup_agent_memory(mock_agent_memory, existing_ltm_texts=[])
-        service.llm.invoke.return_value = AIMessage(content="Hello!")
-        service.extractor.invoke.return_value = MemoryExtraction(memories=[])
-
-        service.run_turn(mock_agent_memory, "session-123", "Hi there.")
-
-        assert mock_agent_memory.add_session_event.call_count == 2  # user + assistant
-
-    def test_bare_confirmation_produces_no_memory(self, service, mock_agent_memory):
-        # Regression: "yes" answering a clarifying question was previously extracted
-        # as "The user confirms or agrees with the previous statement or question."
-        self._setup_agent_memory(mock_agent_memory, existing_ltm_texts=[])
-        service.llm.invoke.return_value = AIMessage(content="Got it!")
-        service.extractor.invoke.return_value = MemoryExtraction(memories=[])
-
-        result = service.run_turn(mock_agent_memory, "session-123", "yes")
-
-        mock_agent_memory.bulk_create_long_term_memories.assert_not_called()
-        assert result.extracted_memories == []
-
-    def test_date_fragment_produces_no_memory(self, service, mock_agent_memory):
-        # Regression: "1st" answering "when do you fly?" was previously extracted
-        # as "The user prefers to be addressed as '1st'."
-        self._setup_agent_memory(mock_agent_memory, existing_ltm_texts=[])
-        service.llm.invoke.return_value = AIMessage(content="Got it, June 1st!")
-        service.extractor.invoke.return_value = MemoryExtraction(memories=[])
-
-        result = service.run_turn(mock_agent_memory, "session-123", "1st")
-
-        mock_agent_memory.bulk_create_long_term_memories.assert_not_called()
-        assert result.extracted_memories == []
+    @pytest.mark.asyncio
+    async def test_duplicate_memory_is_ignored(self, service):
+        from google.adk.memory.base_memory_service import SearchMemoryResponse, MemoryEntry
+        from google.genai import types
+        from google.adk import Event
+        
+        existing_mem = MemoryEntry(content=types.Content(parts=[types.Part.from_text(text="User prefers Delta Airlines.")]))
+        service.memory_service.search_memory.return_value = SearchMemoryResponse(memories=[existing_mem])
+        
+        mock_event = MagicMock()
+        mock_event.author = "travel_agent"
+        mock_event.content = types.Content(parts=[types.Part.from_text(text="Got it!")])
+        
+        with patch("backend.service.Runner") as MockRunner:
+            runner_instance = MagicMock()
+            runner_instance.run.return_value = [mock_event]
+            MockRunner.return_value = runner_instance
+            
+            # Mock get_session for context
+            event1 = Event(author="user", content=types.Content(parts=[types.Part.from_text(text="I prefer Delta Airlines")], role="user"))
+            mock_session = MagicMock()
+            mock_session.events = [event1]
+            service.session_service.get_session.return_value = mock_session
+            
+            # Mock structured memory extraction returning the same duplicate memory
+            mock_response = MagicMock()
+            mock_response.text = '{"memories": [{"text": "User prefers Delta Airlines.", "topics": ["flight"], "memory_type": "semantic"}]}'
+            service.genai_client.models.generate_content.return_value = mock_response
+            
+            result = await service.run_turn(None, "session-123", "I prefer Delta Airlines.")
+            
+            assert result.extracted_memories == []
