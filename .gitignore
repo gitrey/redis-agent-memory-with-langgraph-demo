@@ -39,3 +39,11 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+
+# ADK and Agent Runtime
+.adk/
+backend/.adk/
+.antigravitycli/
+travel_agent/
+scratch_*.py
+

@@ -7,11 +7,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from .memory import RedisAgentMemoryService, load_config, new_session_id
 from pydantic import BaseModel, Field
-from redis_agent_memory import AgentMemory
 
 
 logger = logging.getLogger("uvicorn.error")
-app = FastAPI(title="Redis Agent Memory with LangGraph Demo")
+app = FastAPI(title="Google ADK 2.0 Agent Memory Demo")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -61,15 +61,6 @@ def get_service() -> RedisAgentMemoryService:
     return RedisAgentMemoryService(load_config())
 
 
-def agent_memory_client(service: RedisAgentMemoryService) -> AgentMemory:
-    config = service.config
-    return AgentMemory(
-        config.agent_memory_server_url,
-        store_id=config.agent_memory_store_id,
-        api_key=config.agent_memory_api_key,
-    )
-
-
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
@@ -77,21 +68,11 @@ def health() -> HealthResponse:
 
 @app.get("/api/ready", response_model=ReadinessResponse)
 def ready() -> ReadinessResponse:
-    service = get_service()
-    try:
-        with agent_memory_client(service) as agent_memory:
-            agent_memory_health = agent_memory.health(timeout_ms=3000)
-    except Exception as exc:
-        logger.warning("Redis Agent Memory readiness check failed", exc_info=True)
-        raise HTTPException(
-            status_code=503,
-            detail="Redis Agent Memory is not ready",
-        ) from exc
-
-    agent_memory_payload = AgentMemoryHealthResponse.model_validate(agent_memory_health.model_dump())
-    logger.debug("Redis Agent Memory readiness check succeeded: %s", agent_memory_payload.model_dump())
-
-    return ReadinessResponse(status="ok", agent_memory=agent_memory_payload)
+    # Always ready because ADK's InMemory session and memory services are fully self-contained
+    return ReadinessResponse(
+        status="ok",
+        agent_memory=AgentMemoryHealthResponse(status="ok")
+    )
 
 
 @app.post("/api/sessions", response_model=SessionResponse)
@@ -100,34 +81,31 @@ def create_session() -> SessionResponse:
 
 
 @app.get("/api/sessions/{session_id}/memory", response_model=SessionMemoryResponse)
-def get_session_memory(session_id: str) -> SessionMemoryResponse:
+async def get_session_memory(session_id: str) -> SessionMemoryResponse:
     service = get_service()
     try:
-        with agent_memory_client(service) as agent_memory:
-            memory = service.read_session_context(agent_memory, session_id)
+        memory = await service.read_session_context(session_id)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return SessionMemoryResponse(session_id=session_id, short_term_memory=memory)
 
 
 @app.delete("/api/sessions/{session_id}/memory", response_model=SessionMemoryResponse)
-def delete_session_memory(session_id: str) -> SessionMemoryResponse:
+async def delete_session_memory(session_id: str) -> SessionMemoryResponse:
     service = get_service()
     try:
-        with agent_memory_client(service) as agent_memory:
-            service.delete_session_memory(agent_memory, session_id)
+        await service.delete_session_memory(session_id)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return SessionMemoryResponse(session_id=session_id, short_term_memory=[])
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+async def chat(request: ChatRequest) -> ChatResponse:
     service = get_service()
     session_id = request.session_id or new_session_id()
     try:
-        with agent_memory_client(service) as agent_memory:
-            result = service.run_turn(agent_memory, session_id, request.message.strip())
+        result = await service.run_turn(session_id, request.message.strip())
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
