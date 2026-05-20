@@ -1,12 +1,6 @@
-"""API endpoint tests using FastAPI TestClient.
-
-get_service() is called directly (not via Depends), so we patch it at the
-module level. agent_memory_client() is also patched so no real Redis
-connection is attempted.
-"""
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,9 +13,25 @@ from backend.memory import TurnResult
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
+def _make_turn_result(**kwargs) -> TurnResult:
+    defaults = dict(
+        session_id="session-abc12345",
+        user_text="Hello",
+        assistant_text="Hi there!",
+        session_context=["user: Hello"],
+        long_term_memories=["Prefers Delta"],
+        extracted_memories=["User said hello"],
+    )
+    return TurnResult(**{**defaults, **kwargs})
+
+
 @pytest.fixture
 def mock_service():
-    return MagicMock()
+    m = MagicMock()
+    m.read_session_context = AsyncMock(return_value=[])
+    m.delete_session_memory = AsyncMock(return_value=None)
+    m.run_turn = AsyncMock(return_value=_make_turn_result())
+    return m
 
 
 @pytest.fixture
@@ -35,8 +45,8 @@ def mock_agent_memory():
 
 @pytest.fixture
 def client(mock_service, mock_agent_memory):
-    with patch("backend.app.get_service", return_value=mock_service), \
-         patch("backend.app.agent_memory_client", return_value=mock_agent_memory):
+    with patch("backend.main.get_service", return_value=mock_service), \
+         patch("backend.main.agent_memory_client", return_value=mock_agent_memory):
         yield TestClient(app)
 
 
@@ -58,12 +68,8 @@ class TestHealthEndpoint:
 
 class TestReadinessEndpoint:
     def test_happy_path_returns_200(self, mock_service, mock_agent_memory):
-        health_response = MagicMock()
-        health_response.model_dump.return_value = {"status": "ok"}
-        mock_agent_memory.health.return_value = health_response
-
-        with patch("backend.app.get_service", return_value=mock_service), \
-             patch("backend.app.agent_memory_client", return_value=mock_agent_memory):
+        with patch("backend.main.get_service", return_value=mock_service), \
+             patch("backend.main.agent_memory_client", return_value=mock_agent_memory):
             response = TestClient(app).get("/api/ready")
 
         assert response.status_code == 200
@@ -71,10 +77,10 @@ class TestReadinessEndpoint:
         assert response.json()["agent_memory"]["status"] == "ok"
 
     def test_returns_503_when_memory_unreachable(self, mock_service, mock_agent_memory):
-        mock_agent_memory.health.side_effect = RuntimeError("connection refused")
+        mock_service.memory_service = None
 
-        with patch("backend.app.get_service", return_value=mock_service), \
-             patch("backend.app.agent_memory_client", return_value=mock_agent_memory):
+        with patch("backend.main.get_service", return_value=mock_service), \
+             patch("backend.main.agent_memory_client", return_value=mock_agent_memory):
             response = TestClient(app).get("/api/ready")
 
         assert response.status_code == 503
@@ -143,18 +149,6 @@ class TestDeleteSessionMemoryEndpoint:
 # ---------------------------------------------------------------------------
 # POST /api/chat
 # ---------------------------------------------------------------------------
-
-def _make_turn_result(**kwargs) -> TurnResult:
-    defaults = dict(
-        session_id="session-abc12345",
-        user_text="Hello",
-        assistant_text="Hi there!",
-        session_context=["user: Hello"],
-        long_term_memories=["Prefers Delta"],
-        extracted_memories=["User said hello"],
-    )
-    return TurnResult(**{**defaults, **kwargs})
-
 
 class TestChatEndpoint:
     def test_returns_200(self, client, mock_service):

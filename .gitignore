@@ -39,3 +39,11 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+
+# ADK and tool local files
+.adk/
+**/_adk/
+travel_agent/
+.antigravitycli/
+scratch_deploy.py
+scratch_logs.py
