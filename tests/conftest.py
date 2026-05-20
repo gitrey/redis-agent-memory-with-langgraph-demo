@@ -24,3 +24,28 @@ def make_not_found_error() -> NotFoundErrorResponseContent:
         type=NotFoundErrorType.ROOT_ERRORS_RESOURCE_NOT_FOUND,
     )
     return NotFoundErrorResponseContent(data=data, raw_response=response)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def mock_gemini_calls():
+    """Globally mock Gemini model async content generation to avoid real API calls."""
+    import google.adk.models.google_llm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    original_generate = google.adk.models.google_llm.Gemini.generate_content_async
+
+    async def mock_generate_content_async(self, llm_request, stream=False):
+        yield LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part.from_text(text="I am a helpful travel concierge. How can I help you today?")]
+            ),
+            partial=False,
+            turn_complete=True,
+        )
+
+    google.adk.models.google_llm.Gemini.generate_content_async = mock_generate_content_async
+    yield
+    google.adk.models.google_llm.Gemini.generate_content_async = original_generate
+

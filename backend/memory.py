@@ -166,11 +166,237 @@ def explain_agent_memory_error(operation: str, exc: Exception) -> RuntimeError:
     return RuntimeError(f"{hint}\n\nOriginal error: {exc}")
 
 
+import asyncio
+import threading
+from concurrent.futures import Future
+
+_loop = None
+_loop_thread = None
+
+def _start_loop():
+    global _loop, _loop_thread
+    _loop = asyncio.new_event_loop()
+    _loop_thread = threading.Thread(target=_loop.run_forever, daemon=True)
+    _loop_thread.start()
+
+def run_sync(coro):
+    global _loop
+    if _loop is None:
+        _start_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result()
+
+
+class ADKNotFoundError(Exception):
+    def __init__(self, message: str = "Resource not found"):
+        super().__init__(message)
+        self.status_code = 404
+
+
+class EventCompat:
+    def __init__(self, role: str, text: str):
+        self.role = role
+        self.content = [{"text": text}]
+
+
+class SessionResponseCompat:
+    def __init__(self, events: list[EventCompat]):
+        self.events = events
+
+
+class ADKHealthResponse:
+    def model_dump(self):
+        return {"status": "ok"}
+
+
+class ADKAgentMemoryAdapter:
+    def __init__(self, service: RedisAgentMemoryService) -> None:
+        self.service = service
+        self.session_service = service.session_service
+        self.memory_service = service.memory_service
+        self.config = service.config
+        self.local_memories = service.local_memories
+
+    def __enter__(self) -> ADKAgentMemoryAdapter:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass
+
+    def get_session_memory(self, session_id: str) -> SessionResponseCompat:
+        session = run_sync(self.session_service.get_session(
+            app_name=self.config.namespace,
+            user_id=self.config.owner_id,
+            session_id=session_id
+        ))
+        if session is None or not session.events:
+            raise ADKNotFoundError(f"Session {session_id} not found")
+
+        events = []
+        for event in session.events:
+            role = event.author or "user"
+            if role == "model":
+                role = "assistant"
+            
+            text = ""
+            if event.content and event.content.parts:
+                text = "\n".join(part.text for part in event.content.parts if part.text)
+            
+            events.append(EventCompat(role=role, text=text))
+        
+        return SessionResponseCompat(events=events)
+
+    def add_session_event(
+        self,
+        session_id: str,
+        actor_id: str,
+        role: object,
+        content: list[dict],
+        created_at: datetime,
+        metadata: dict,
+    ) -> None:
+        session = run_sync(self.session_service.get_session(
+            app_name=self.config.namespace,
+            user_id=self.config.owner_id,
+            session_id=session_id
+        ))
+        if session is None:
+            session = run_sync(self.session_service.create_session(
+                app_name=self.config.namespace,
+                user_id=self.config.owner_id,
+                session_id=session_id
+            ))
+
+        from google.adk.sessions.session import Event
+        from google.genai.types import Content, Part
+
+        author = str(getattr(role, "value", role)).lower()
+        if author == "assistant":
+            author = "model"
+
+        parts = []
+        for item in content or []:
+            text_val = item.get("text") or ""
+            if text_val:
+                parts.append(Part(text=text_val))
+
+        event = Event(
+            author=author,
+            content=Content(parts=parts, role=author)
+        )
+        run_sync(self.session_service.append_event(session, event))
+
+    def search_long_term_memory(self, request: dict) -> dict:
+        query = request.get("text") or ""
+        
+        query_words = set(normalize_memory_text(query).split())
+        matched = []
+        for m in self.local_memories.values():
+            m_text = m.get("text", "")
+            m_words = set(normalize_memory_text(m_text).split())
+            common = query_words.intersection(m_words)
+            if common or not query_words:
+                matched.append((len(common), m))
+        
+        matched.sort(key=lambda x: x[0], reverse=True)
+        items = [item for _, item in matched[:5]]
+        
+        from google.adk.memory import InMemoryMemoryService
+        if not isinstance(self.memory_service, InMemoryMemoryService):
+            try:
+                resp = run_sync(self.memory_service.search_memory(
+                    app_name=self.config.namespace,
+                    user_id=self.config.owner_id,
+                    query=query
+                ))
+                seen_texts = {normalize_memory_text(item.get("text", "")) for item in items}
+                for m in resp.memories:
+                    text = ""
+                    if m.content and m.content.parts:
+                        text = "\n".join(p.text for p in m.content.parts if p.text)
+                    if text:
+                        norm_text = normalize_memory_text(text)
+                        if norm_text not in seen_texts:
+                            seen_texts.add(norm_text)
+                            items.append({"text": text})
+            except Exception:
+                pass
+                
+        return {"items": items}
+
+    def bulk_create_long_term_memories(self, memories: list[dict]) -> None:
+        for r in memories:
+            self.local_memories[r.get("id")] = r
+            
+        from google.adk.memory import InMemoryMemoryService
+        if not isinstance(self.memory_service, InMemoryMemoryService):
+            from google.adk.memory.memory_entry import MemoryEntry
+            from google.genai.types import Content, Part
+            
+            entries = []
+            for r in memories:
+                entries.append(MemoryEntry(
+                    id=r.get("id"),
+                    content=Content(parts=[Part(text=r.get("text"))], role="user"),
+                    author="user",
+                    custom_metadata={
+                        "sessionId": r.get("sessionId"),
+                        "topics": r.get("topics", []),
+                        "memoryType": r.get("memoryType", "semantic"),
+                        "namespace": r.get("namespace"),
+                    }
+                ))
+            try:
+                run_sync(self.memory_service.add_memory(
+                    app_name=self.config.namespace,
+                    user_id=self.config.owner_id,
+                    memories=entries
+                ))
+            except Exception:
+                pass
+
+    def delete_session_memory(self, session_id: str) -> None:
+        run_sync(self.session_service.delete_session(
+            app_name=self.config.namespace,
+            user_id=self.config.owner_id,
+            session_id=session_id
+        ))
+
+    def health(self, timeout_ms: int = 3000) -> ADKHealthResponse:
+        return ADKHealthResponse()
+
+
 class RedisAgentMemoryService:
     def __init__(self, config: DemoConfig) -> None:
         self.config = config
         self.llm = ChatOpenAI(model=config.openai_model, temperature=0.2)
         self.extractor = self.llm.with_structured_output(MemoryExtraction)
+        self.local_memories = {}
+        
+        if os.getenv("GOOGLE_GENAI_USE_VERTEXAI") == "True" or os.getenv("AGENT_ENGINE_ID") or os.getenv("DEPLOYMENT_TARGET") == "agent_runtime":
+            from google.adk.sessions import VertexAiSessionService
+            from google.adk.memory import VertexAiMemoryBankService
+            
+            project = os.getenv("GOOGLE_CLOUD_PROJECT")
+            location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-east1")
+            agent_engine_id = os.getenv("AGENT_ENGINE_ID")
+            
+            self.session_service = VertexAiSessionService(
+                project=project,
+                location=location,
+                agent_engine_id=agent_engine_id
+            )
+            self.memory_service = VertexAiMemoryBankService(
+                project=project,
+                location=location,
+                agent_engine_id=agent_engine_id
+            )
+        else:
+            from google.adk.sessions import InMemorySessionService
+            from google.adk.memory import InMemoryMemoryService
+            
+            self.session_service = InMemorySessionService()
+            self.memory_service = InMemoryMemoryService()
 
     def build_graph(self, agent_memory: AgentMemory):
         def retrieve_session_context(state: AgentState) -> dict:
@@ -406,3 +632,6 @@ Relevant long-term memories:
         except Exception as exc:
             if not is_not_found_error(exc):
                 raise explain_agent_memory_error("session memory delete", exc)
+
+
+ADKAgentMemoryService = RedisAgentMemoryService
