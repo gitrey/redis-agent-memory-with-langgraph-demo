@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from .memory import RedisAgentMemoryService, load_config, new_session_id
 from pydantic import BaseModel, Field
-from redis_agent_memory import AgentMemory
+from .memory import ADKAgentMemoryAdapter as AgentMemory
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -62,12 +62,7 @@ def get_service() -> RedisAgentMemoryService:
 
 
 def agent_memory_client(service: RedisAgentMemoryService) -> AgentMemory:
-    config = service.config
-    return AgentMemory(
-        config.agent_memory_server_url,
-        store_id=config.agent_memory_store_id,
-        api_key=config.agent_memory_api_key,
-    )
+    return AgentMemory(service)
 
 
 @app.get("/api/health", response_model=HealthResponse)

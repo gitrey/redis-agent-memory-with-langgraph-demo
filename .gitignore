@@ -39,3 +39,7 @@ dist/
 .idea/
 .vscode/
 .DS_Store
+
+# Antigravity CLI
+.antigravitycli/
+
